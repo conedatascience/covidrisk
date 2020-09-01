@@ -1,0 +1,155 @@
+---
+title: "A Method to Quantify the Risk of Encounting Covid-19"
+author: 
+  - name: "Michael DeWitt"
+    url: "mailto:michael.dewitt@conehealth.com"
+    affiliation: Cone Health
+    affiliation_url: https://www.conehealth.com
+date: "9/1/2020"
+output: distill::distill_article
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(data.table)
+library(dplyr)
+lapply(list.files("R", full.names = TRUE), source)
+```
+
+# Introduction
+
+The purpose of this analysis is to estimate the risk of encountering someone who is SARS-CoV-2 positive given a an average number of cases per day.
+Risk is subjective (i.e. each person has their own tolerance for risk) and thus this analysis provides a probability which can then be used to calibrate one's risk tolerance.
+
+# Methodology
+
+## Average Daily Cases to Active Infections
+
+The first step in the analysis is to determine the number of likely infected persons given a case rate.
+This is done through a stochastic compartmental model that models the number of susceptible, the number of infected/infectious, and the removed persons (either through recovery or death).
+Births/ exits were not modeled in this analysis and can be ignored given the short time horizon.
+
+This model can be represented as follows:
+
+$$
+\frac{\partial S}{\partial t} \sim -Poi(\epsilon) \\
+\frac{\partial I}{\partial t} \sim Poi(\epsilon) - Bin(n_I,\text{P(Recovery)}) \\
+\frac{\partial R}{\partial t} \sim Bin(n_I, \text{P(Recovery)}) \\
+\text{Where:} \\
+\epsilon = \text{ Cases per Day} \\
+P(Recovery) = 1 - e^{-\text{Recovery Rate}} \\
+\text{Recovery Rate} = \text{Average Infectious Time (days)}
+$$
+
+A Poisson distribution was chosen for simplicity. 
+Other distributions could be a lognormal or Erlang distribution in order to captured the case rate distribution. 
+Regardless, for approximation, the Poisson distribution is a good approximation for the entry rate into this system.
+
+This stochastic system of ordinary differential equations is run 100 iterations and the results are outputs for the number of infected persons on average given the user specified rate.
+Additionally, there is an option to increase the estimated number of infected by the testing positivity rate.
+Because of the relatively high positivity rate in the state of North Carolina (>5%) it is recommended to multiple the simulated number of infected based on the positive testing rate.
+A quick rule of thumb is to multiple the reported cases by the positive testing rate when the rate is greater than 1%, especially for infections with a high proportion of asymptomatic cases.
+For instance if there are 10 cases reported with a 5% positive testing rate, that means that there are likely 50 "true" cases in the community.
+This is an option and is included in the simulation (my recommendation is to set this value to 5% to reflect local positive testing rates).
+
+## Probability of a Positive Contact
+
+With a given number of infected persons calculated above, we can solve the equivalent of the "Birthday Problem" which is given a series of Bernoilli trials, what is the probability that you come in contact with a person that is in the "infected/infectious" compartment.
+
+$$
+P(\text{Covid+ Encounter}) \sim Bin(n, \theta)\\
+\text{Where:} \\
+n = \text{Number of Contacts} \\
+\theta = \frac{\text{Number Infected}}{\text{Population of Alamance county}}
+$$
+
+This can be solved with a Taylor approximation:
+
+$$
+P(\text{Covid+ Encounter}) \approx 1 - e^{-n*\theta}
+$$
+
+
+# Simulation
+
+## Data Preparation for Alamance
+
+We can pull the daily cases using the [nccovid package](https://github.com/conedatascience/nccovid) which is a locally developed R package that uses the [scraped records](https://github.com/conedatascience/covid-data) from the [North Carolina Department of Health and Human Services Covid-19 dashboard](https://covid19.ncdhhs.gov/dashboard).
+
+```{r cars}
+alamance_cases <- nccovid::get_covid_state(select_county = "Alamance")
+```
+
+We can also pull the population from the nccovid package as well which has the latest estimates from the North Carolina State Demographer.
+
+```{r}
+
+alamance_population <- nccovid::nc_population
+
+(alamance_population <- alamance_population[county=="Alamance"]$july_2020)
+
+```
+
+Now we can calculated the 7 day rolling average cases per 100k.
+
+```{r}
+alamance_complete <- alamance_cases[, avg_daily_cases_per_100k := cases_daily/(alamance_population/100000)] %>% 
+  .[,avg_daily_cases_per_100k_rolling := zoo::rollmean(avg_daily_cases_per_100k, 
+                                                       k = 7, 
+                                                       align = "right",
+                                                       na.pad = TRUE)]
+
+plot(alamance_complete[,date],
+     alamance_complete[,avg_daily_cases_per_100k_rolling], 
+     ylab = "Rolling Avg Cases per Day",
+     xlab = '', type = 'b', pch = 19,
+     main = "Average Daily Report Cases per Day in Alamance", adj = 0)
+```
+
+## Generate Simulation Grid
+
+Given the above methodology, we can create a simulation grid which represent the different scenarios for which we wish to solve.
+
+```{r}
+gathering_size <- seq(10,50,5)
+cases_per_100 <- 1:25
+
+sim_options <- tidyr::crossing(gathering_size, 
+                               cases_per_100, 
+                               pop = alamance_population)
+
+```
+
+We can then use our created functions to iterate over this grid of scenarios.
+
+```{r}
+results <-purrr::pmap_dbl(.l = list(..1=sim_options$gathering_size,
+                                    ..2=sim_options$cases_per_100,
+                                    ..3 = sim_options$pop),
+                          ~calc_risk(I = mean(
+                            run_infections_simulation(n_people = 10000,
+                                                    contact_rate_per_day = ..2,
+                                                    positive_test_rate = .05,
+                                                    infectious_period =
+                                                      12)[["average_q"]])*..3/100000,
+                            n = ..1, pop = ..3))
+
+```
+
+Put the outputs together:
+
+```{r}
+output <- tibble::tibble(
+  gathering_size = sim_options$gathering_size,
+  cases_per_100 = sim_options$cases_per_100,
+  prob_someone_having_covid = results
+)
+```
+
+```{r}
+DT::datatable(output, 
+              colnames = c("Contacts per Day", "Cases per 100k", "P(Covid Contact) %"), 
+              rownames = FALSE)
+```
+
+
